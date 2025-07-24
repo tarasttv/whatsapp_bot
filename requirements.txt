@@ -5,7 +5,6 @@ aiohttp-retry==2.9.1
 aiosignal==1.4.0
 antlr4-python3-runtime==4.9.3
 appdirs==1.4.4
-apturl==0.5.2
 astunparse==1.6.3
 async-timeout==5.0.1
 attrs==21.2.0
