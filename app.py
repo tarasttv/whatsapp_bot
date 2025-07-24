@@ -1,44 +1,46 @@
+import os
+import json
 from flask import Flask, request
-import gspread
 from oauth2client.service_account import ServiceAccountCredentials
-from datetime import datetime
+import gspread
+from twilio.twiml.messaging_response import MessagingResponse
+from dotenv import load_dotenv
+
+# Загружаем переменные из .env (для локального запуска, Render это игнорирует)
+load_dotenv()
 
 app = Flask(__name__)
 
-# Подключение к Google Sheets
-scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-creds = ServiceAccountCredentials.from_json_keyfile_name("credentials.json", scope)
+# Авторизация через переменную среды GOOGLE_CREDENTIALS_JSON
+scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
+credentials_json = os.environ.get("GOOGLE_CREDENTIALS_JSON")
+
+if not credentials_json:
+    raise Exception("Переменная окружения GOOGLE_CREDENTIALS_JSON не установлена")
+
+credentials_dict = json.loads(credentials_json)
+creds = ServiceAccountCredentials.from_json_keyfile_dict(credentials_dict, scope)
 client = gspread.authorize(creds)
 
-# Подключение к таблице
-spreadsheet = client.open_by_url("https://docs.google.com/spreadsheets/d/1UYpvOUFI_Ft2nJy8H0G8okse5H1DJcLYWpwn_6swiK0/edit?usp=sharing")
-worksheet = spreadsheet.sheet1
+# Открываем таблицу по названию
+sheet = client.open("whatsapp_bot_sheet").sheet1
 
-def log_to_sheet(phone_number, message_text):
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    next_row = len(worksheet.get_all_values()) + 1
-    request_id = f"Z{next_row:04d}"
-    worksheet.append_row([now, phone_number, message_text, request_id])
+@app.route("/webhook", methods=['POST'])
+def whatsapp_reply():
+    incoming_msg = request.values.get('Body', '').strip()
+    sender_number = request.values.get('From', '')
 
-@app.route("/webhook", methods=["POST"])
-def webhook():
-    data = request.get_json()
-    
-    try:
-        phone_number = data["entry"][0]["changes"][0]["value"]["messages"][0]["from"]
-        message_text = data["entry"][0]["changes"][0]["value"]["messages"][0]["text"]["body"]
+    print(f"Сообщение от {sender_number}: {incoming_msg}")
 
-        # Логируем в Google Sheets
-        log_to_sheet(phone_number, message_text)
+    # Сохраняем сообщение в Google Sheets
+    sheet.append_row([sender_number, incoming_msg])
 
-        # Ответ (если ты используешь библиотеку или API для отправки ответа — добавь здесь)
-        print(f"Сообщение от {phone_number}: {message_text}")
+    # Формируем ответ
+    resp = MessagingResponse()
+    reply = resp.message("Спасибо! Ваше сообщение записано.")
 
-    except Exception as e:
-        print(f"Ошибка: {e}")
-
-    return "ok", 200
+    return str(resp)
 
 if __name__ == "__main__":
-    app.run(debug=False, host="0.0.0.0", port=5000)
+    app.run(host="0.0.0.0", port=5000)
 
