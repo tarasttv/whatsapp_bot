@@ -1,7 +1,9 @@
 services:
   - type: web
-    name: whatsapp-autoresponder
+    name: whatsapp-bot
     env: python
-    plan: free
-    buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn app:app
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "python3 app.py"
+    envVars:
+      - key: PORT
+        value: 5000
