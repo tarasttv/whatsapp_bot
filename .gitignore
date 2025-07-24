@@ -1,0 +1,25 @@
+# Игнорируем файлы с токенами и конфиденциальными данными
+token.txt
+*.env
+
+# Служебные файлы и папки Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Логи и дампы
+*.log
+*.sqlite3
+*.db
+
+# Виртуальные окружения
+venv/
+env/
+
+# VS Code, PyCharm и другие IDE
+.vscode/
+.idea/
+
+# ngrok бинарник
+ngrok*
