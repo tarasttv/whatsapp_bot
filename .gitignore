@@ -24,3 +24,4 @@ env/
 # ngrok бинарник
 ngrok*
 credentials.json
+credentials.json
