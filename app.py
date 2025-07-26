@@ -15,6 +15,8 @@ openai.api_key = os.getenv("OPENAI_API_KEY")
 
 # Авторизация для Google Sheets
 scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+print("Текущая директория:", os.getcwd())
+print("Содержимое папки:", os.listdir())
 creds = ServiceAccountCredentials.from_json_keyfile_name("creds.json", scope)
 client = gspread.authorize(creds)
 sheet = client.open("whatsapp_bot_sheet").sheet1
