@@ -1,56 +1,116 @@
+from dotenv import load_dotenv
+load_dotenv()
 import os
-import json
-from flask import Flask, request
+import openai
+import datetime
 import gspread
+from flask import Flask, request
 from oauth2client.service_account import ServiceAccountCredentials
-from datetime import datetime
+from twilio.twiml.messaging_response import MessagingResponse
 
 app = Flask(__name__)
 
-# Загрузка учётных данных из переменной окружения
-google_credentials_json = os.getenv("GOOGLE_CREDENTIALS_JSON")
-if not google_credentials_json:
-    raise Exception("Переменная окружения GOOGLE_CREDENTIALS_JSON не установлена")
+# Укажи свой OpenAI API-ключ
+openai.api_key = os.getenv("OPENAI_API_KEY")
 
-# Преобразуем строку JSON в словарь и сохраняем во временный файл
-credentials_dict = json.loads(google_credentials_json)
-with open("temp_credentials.json", "w") as f:
-    json.dump(credentials_dict, f)
-
-# Подключение к Google Sheets
+# Авторизация для Google Sheets
 scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-creds = ServiceAccountCredentials.from_json_keyfile_name("temp_credentials.json", scope)
+creds = ServiceAccountCredentials.from_json_keyfile_name("creds.json", scope)
 client = gspread.authorize(creds)
-
-# Открытие таблицы по имени
 sheet = client.open("whatsapp_bot_sheet").sheet1
 
-@app.route("/webhook", methods=['POST'])
+# Хранилище состояний пользователей
+user_states = {}
+user_messages = {}
+
+@app.route("/webhook", methods=["POST"])
 def whatsapp_reply():
-    # Получаем сообщение и номер отправителя из запроса
-    incoming_msg = request.values.get('Body', '').strip()
-    sender_number = request.values.get('From', '').strip()
+    incoming_msg = request.values.get("Body", "").strip()
+    sender_number = request.values.get("From", "").replace("whatsapp:", "")
+    resp = MessagingResponse()
+    msg = resp.message()
 
-    # Получаем текущую дату и время
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    state = user_states.get(sender_number, "start")
+    dialog = user_messages.get(sender_number, [])
 
-    # Генерируем номер заявки (номер строки - 1)
-    last_row = len(sheet.get_all_values())
-    request_id = str(last_row)  # можно +1, если без заголовков
+    if state == "start":
+        user_states[sender_number] = "awaiting_choice"
+        user_messages[sender_number] = [f"Пользователь: {incoming_msg}"]
+        msg.body(
+            "Добрый день! Чем я могу помочь?\n"
+            "1. Консультация\n"
+            "2. Ремонт / Диагностика\n"
+            "3. Помощь с программным обеспечением"
+        )
+        return str(resp)
 
-    # Добавляем запись в таблицу: Заявка № | Дата/время | Номер отправителя | Сообщение
-    sheet.append_row([request_id, now, sender_number, incoming_msg])
+    elif state == "awaiting_choice":
+        dialog.append(f"Пользователь: {incoming_msg}")
+        if incoming_msg == "1":
+            user_states[sender_number] = "consultation"
+            msg.body("Расскажите подробнее, с чем Вам необходимо помочь?")
+        elif incoming_msg == "2":
+            user_states[sender_number] = "repair"
+            msg.body("Что у Вас случилось? Напишите вид оборудования и проблему.")
+        elif incoming_msg == "3":
+            user_states[sender_number] = "software"
+            msg.body("Опишите, что необходимо настроить или установить.")
+        else:
+            msg.body("Пожалуйста, введите 1, 2 или 3.")
+        return str(resp)
 
-    # Отправляем автоответ
-    return f"""<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-    <Message>Спасибо, Ваша заявка записана. Мы скоро с Вами свяжемся.</Message>
-</Response>""", 200, {'Content-Type': 'application/xml'}
+    elif state == "consultation":
+        dialog.append(f"Пользователь: {incoming_msg}")
+        # GPT-ответ
+        response = openai.ChatCompletion.create(
+            model="gpt-4",
+            messages=[
+                {"role": "system", "content": "Ты технический консультант. Отвечай простым, понятным языком."},
+                {"role": "user", "content": incoming_msg}
+            ],
+            max_tokens=200
+        )
+        gpt_reply = response.choices[0].message['content'].strip()
+        dialog.append(f"Бот: {gpt_reply}")
+        msg.body(gpt_reply)
+        save_to_sheet(sender_number, dialog)
+        user_states.pop(sender_number)
+        user_messages.pop(sender_number)
+        return str(resp)
 
-@app.route("/", methods=['GET'])
-def home():
-    return "WhatsApp Bot is running ✅"
+    elif state == "repair":
+        dialog.append(f"Пользователь: {incoming_msg}")
+        reply = "Понятно, передаю Вашу заявку в сервисный центр."
+        dialog.append(f"Бот: {reply}")
+        msg.body(reply)
+        save_to_sheet(sender_number, dialog)
+        user_states.pop(sender_number)
+        user_messages.pop(sender_number)
+        return str(resp)
+
+    elif state == "software":
+        dialog.append(f"Пользователь: {incoming_msg}")
+        reply = "Понятно, передаю Вашу заявку в сервисный центр."
+        dialog.append(f"Бот: {reply}")
+        msg.body(reply)
+        save_to_sheet(sender_number, dialog)
+        user_states.pop(sender_number)
+        user_messages.pop(sender_number)
+        return str(resp)
+
+    else:
+        msg.body("Произошла ошибка. Попробуйте снова.")
+        user_states.pop(sender_number, None)
+        user_messages.pop(sender_number, None)
+        return str(resp)
+
+
+def save_to_sheet(phone, dialog):
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    conversation = "\n".join(dialog)
+    sheet.append_row([timestamp, phone, conversation])
+
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000)
+    app.run(debug=True)
 

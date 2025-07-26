@@ -25,3 +25,4 @@ env/
 ngrok*
 credentials.json
 credentials.json
+.env
