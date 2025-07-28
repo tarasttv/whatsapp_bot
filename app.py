@@ -32,7 +32,7 @@ if "\\n" in creds_dict["private_key"]:
     creds_dict["private_key"] = creds_dict["private_key"].replace("\\n", "\n")
 
 # Создаём credentials
-creds = service_account.Credentials.from_service_account_info(creds_dict)
+creds = service_account.Credentials.from_service_account_info(creds_dict, scopes=scope)
 client = gspread.authorize(creds)
 sheet = client.open("whatsapp_bot_sheet").sheet1
 
