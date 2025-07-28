@@ -6,6 +6,7 @@ import datetime
 import gspread
 import json
 from flask import Flask, request
+from google.oauth2 import service_account  # <-- добавлено
 from oauth2client.service_account import ServiceAccountCredentials
 from twilio.twiml.messaging_response import MessagingResponse
 
@@ -24,9 +25,10 @@ creds_json = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
 creds_dict = json.loads(creds_json)
 
 # Преобразуем private_key, если нужно
-    if "\\n" in creds_dict["private_key"]:
-        creds_dict["private_key"] = creds_dict["private_key"].replace("\\n", "\n")
+if "\\n" in creds_dict["private_key"]:
+    creds_dict["private_key"] = creds_dict["private_key"].replace("\\n", "\n")
 
+# Создаём credentials
 creds = service_account.Credentials.from_service_account_info(creds_dict)
 client = gspread.authorize(creds)
 sheet = client.open("whatsapp_bot_sheet").sheet1
@@ -126,6 +128,4 @@ def save_to_sheet(phone, dialog):
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
-
-
 
