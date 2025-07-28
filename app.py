@@ -22,10 +22,12 @@ print("Содержимое папки:", os.listdir())
 # Загружаем creds.json и заменяем \\n на \n в ключе
 creds_json = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
 creds_dict = json.loads(creds_json)
+
+# Преобразуем private_key, если нужно
     if "\\n" in creds_dict["private_key"]:
         creds_dict["private_key"] = creds_dict["private_key"].replace("\\n", "\n")
 
-creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
+creds = service_account.Credentials.from_service_account_info(creds_dict)
 client = gspread.authorize(creds)
 sheet = client.open("whatsapp_bot_sheet").sheet1
 
