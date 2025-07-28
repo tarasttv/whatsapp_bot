@@ -4,6 +4,7 @@ import os
 import openai
 import datetime
 import gspread
+import json
 from flask import Flask, request
 from oauth2client.service_account import ServiceAccountCredentials
 from twilio.twiml.messaging_response import MessagingResponse
@@ -17,7 +18,14 @@ openai.api_key = os.getenv("OPENAI_API_KEY")
 scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
 print("Текущая директория:", os.getcwd())
 print("Содержимое папки:", os.listdir())
-creds = ServiceAccountCredentials.from_json_keyfile_name("creds.json", scope)
+
+# Загружаем creds.json и заменяем \\n на \n в ключе
+with open("creds.json", "r") as f:
+    creds_dict = json.load(f)
+    if "\\n" in creds_dict["private_key"]:
+        creds_dict["private_key"] = creds_dict["private_key"].replace("\\n", "\n")
+
+creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
 client = gspread.authorize(creds)
 sheet = client.open("whatsapp_bot_sheet").sheet1
 
