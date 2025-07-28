@@ -6,4 +6,5 @@ gspread
 oauth2client
 python-dotenv
 python-dotenv
-openai
+openai>=1.0.0
+

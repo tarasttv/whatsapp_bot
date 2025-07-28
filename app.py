@@ -13,7 +13,7 @@ from twilio.twiml.messaging_response import MessagingResponse
 app = Flask(__name__)
 
 # Укажи свой OpenAI API-ключ
-openai.api_key = os.getenv("OPENAI_API_KEY")
+client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 # Авторизация для Google Sheets
 scope = [
@@ -79,15 +79,15 @@ def whatsapp_reply():
     elif state == "consultation":
         dialog.append(f"Пользователь: {incoming_msg}")
         # GPT-ответ
-        response = openai.ChatCompletion.create(
+        response = client.chat.completions.create(
             model="gpt-4",
             messages=[
-                {"role": "system", "content": "Ты технический консультант. Отвечай простым, понятным языком."},
-                {"role": "user", "content": incoming_msg}
-            ],
-            max_tokens=200
+                {"role": "user", "content": "Привет, кто ты?"},
+        ],
+        max_tokens=200
         )
-        gpt_reply = response.choices[0].message['content'].strip()
+        
+        gpt_reply = response.choices[0].message.content.strip()
         dialog.append(f"Бот: {gpt_reply}")
         msg.body(gpt_reply)
         save_to_sheet(sender_number, dialog)
