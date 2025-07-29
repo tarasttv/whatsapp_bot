@@ -78,7 +78,7 @@ def whatsapp_reply():
         dialog.append(f"Пользователь: {incoming_msg}")
         # GPT-ответ
         response = openai_client.chat.completions.create(
-            model="gpt-4",
+            model="gpt-3.5-turbo",
             messages=[{"role": "user", "content": incoming_msg}],
             max_tokens=200
         )
