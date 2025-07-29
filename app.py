@@ -1,40 +1,37 @@
 from dotenv import load_dotenv
 load_dotenv()
+
 import os
-import openai
-from openai import OpenAI
 import datetime
 import gspread
 import json
 from flask import Flask, request
-from google.oauth2 import service_account  # <-- добавлено
-from oauth2client.service_account import ServiceAccountCredentials
+from openai import OpenAI
+from google.oauth2 import service_account
 from twilio.twiml.messaging_response import MessagingResponse
 
 app = Flask(__name__)
 
-# Укажи свой OpenAI API-ключ
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+# Инициализация OpenAI-клиента
+openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 # Авторизация для Google Sheets
 scope = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive"
 ]
-print("Текущая директория:", os.getcwd())
-print("Содержимое папки:", os.listdir())
 
-# Загружаем creds.json и заменяем \\n на \n в ключе
+# Загружаем Google credentials
 creds_json = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
 creds_dict = json.loads(creds_json)
 
-# Преобразуем private_key, если нужно
+# Исправляем переносы строки в private_key
 if "\\n" in creds_dict["private_key"]:
     creds_dict["private_key"] = creds_dict["private_key"].replace("\\n", "\n")
 
-# Создаём credentials
+# Создаём credentials и клиента
 creds = service_account.Credentials.from_service_account_info(creds_dict, scopes=scope)
-gsheets_client = gspread.authorize(creds)  # ✅
+gsheets_client = gspread.authorize(creds)
 sheet = gsheets_client.open("whatsapp_bot_sheet").sheet1
 
 # Хранилище состояний пользователей
@@ -82,10 +79,10 @@ def whatsapp_reply():
         # GPT-ответ
         response = openai_client.chat.completions.create(
             model="gpt-4",
-            messages=[{"role": "user", "content": "Привет, кто ты?"}],
+            messages=[{"role": "user", "content": incoming_msg}],
             max_tokens=200
         )
-        msg.body(response.choices[0].message.content.strip())
+        gpt_reply = response.choices[0].message.content.strip()
         dialog.append(f"Бот: {gpt_reply}")
         msg.body(gpt_reply)
         save_to_sheet(sender_number, dialog)
