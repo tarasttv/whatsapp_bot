@@ -34,8 +34,8 @@ if "\\n" in creds_dict["private_key"]:
 
 # Создаём credentials
 creds = service_account.Credentials.from_service_account_info(creds_dict, scopes=scope)
-client = gspread.authorize(creds)
-sheet = client.open("whatsapp_bot_sheet").sheet1
+gsheets_client = gspread.authorize(creds)  # ✅
+sheet = gsheets_client.open("whatsapp_bot_sheet").sheet1
 
 # Хранилище состояний пользователей
 user_states = {}
@@ -80,12 +80,12 @@ def whatsapp_reply():
     elif state == "consultation":
         dialog.append(f"Пользователь: {incoming_msg}")
         # GPT-ответ
-        response = client.chat.completions.create(
+        response = openai_client.chat.completions.create(
             model="gpt-4",
             messages=[{"role": "user", "content": "Привет, кто ты?"}],
             max_tokens=200
         )
-        gpt_reply = response.choices[0].message.content.strip()
+        msg.body(response.choices[0].message.content.strip())
         dialog.append(f"Бот: {gpt_reply}")
         msg.body(gpt_reply)
         save_to_sheet(sender_number, dialog)
