@@ -2,6 +2,7 @@ from dotenv import load_dotenv
 load_dotenv()
 import os
 import openai
+from openai import OpenAI
 import datetime
 import gspread
 import json
