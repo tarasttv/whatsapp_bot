@@ -3,8 +3,8 @@ twilio
 requests
 gunicorn
 gspread
+google-auth
 oauth2client
-python-dotenv
 python-dotenv
 openai>=1.2.0
 
