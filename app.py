@@ -376,3 +376,6 @@ def whatsapp_reply():
     user_messages.pop(sender_number, None)
     last_question_norm.pop(sender_number, None)
     return str(resp)
+@app.route("/health", methods=["GET", "POST"])
+def health():
+    return ("ok", 200)
