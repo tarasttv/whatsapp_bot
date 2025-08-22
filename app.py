@@ -3,86 +3,212 @@ load_dotenv()
 
 import os
 import datetime
-import gspread
 import json
 import threading
 import time
 import re
+import traceback
+from typing import Dict, List, Optional
+
+import gspread
+from gspread.exceptions import APIError
 from flask import Flask, request
 from openai import OpenAI
 from google.oauth2 import service_account
 from twilio.twiml.messaging_response import MessagingResponse
-from gspread.exceptions import APIError
 
 app = Flask(__name__)
 
+# ===============================
 # OpenAI client
+# ===============================
 openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-# Google Sheets setup
-scope = [
-    "https://www.googleapis.com/auth/spreadsheets",
-    "https://www.googleapis.com/auth/drive"
-]
-creds_json = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
-creds_dict = json.loads(creds_json)
-if "\\n" in creds_dict.get("private_key", ""):
-    creds_dict["private_key"] = creds_dict["private_key"].replace("\\n", "\n")
+# ===============================
+# Google Sheets (ленивая инициализация)
+# ===============================
+GSHEETS_READY = False
+_gsheets_client: Optional[gspread.Client] = None
+_sheet: Optional[gspread.Worksheet] = None
+_gsheets_error: Optional[str] = None
 
-creds = service_account.Credentials.from_service_account_info(creds_dict, scopes=scope)
-gsheets_client = gspread.authorize(creds)
-sheet = gsheets_client.open("whatsapp_bot_sheet").sheet1
+def get_sheet() -> Optional[gspread.Worksheet]:
+    """
+    Ленивая инициализация клиента и листа.
+    Возвращает worksheet или None, если инициализация не удалась.
+    """
+    global GSHEETS_READY, _gsheets_client, _sheet, _gsheets_error
+    if GSHEETS_READY and _sheet is not None:
+        return _sheet
+    try:
+        creds_json = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
+        if not creds_json:
+            raise RuntimeError("GOOGLE_APPLICATION_CREDENTIALS is empty")
+        creds_dict = json.loads(creds_json)
+        if "\\n" in creds_dict.get("private_key", ""):
+            creds_dict["private_key"] = creds_dict["private_key"].replace("\\n", "\n")
 
-# State and message logs for users
-user_states: dict[str, str] = {}
-user_messages: dict[str, list[str]] = {}
+        scope = [
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/drive"
+        ]
+        creds = service_account.Credentials.from_service_account_info(creds_dict, scopes=scope)
+        _gsheets_client = gspread.authorize(creds)
+        _sheet = _gsheets_client.open("whatsapp_bot_sheet").sheet1
+        GSHEETS_READY = True
+        _gsheets_error = None
+        return _sheet
+    except Exception as e:
+        _gsheets_error = f"{e}\n{traceback.format_exc()}"
+        # Не падаем — вернём None; запись попробуем позже/повторно
+        return None
 
-# Queue for pending Google Sheets writes and lock for thread safety
-pending_rows: list[list[str]] = []
+# ===============================
+# Состояния пользователей и хранилища
+# ===============================
+user_states: Dict[str, str] = {}
+user_messages: Dict[str, List[str]] = {}
+
+# Последний нормализованный вопрос пользователя (для детекта повторов)
+last_question_norm: Dict[str, str] = {}
+# Счётчик повторов одинакового вопроса
+repeat_count: Dict[str, int] = {}
+
+# ===============================
+# Очередь на запись в Google Sheets
+# ===============================
+pending_rows: List[List[str]] = []
 pending_lock = threading.Lock()
 
-# Store last normalized user question to detect repeats
-last_question_norm: dict[str, str] = {}
+def save_to_sheet(phone: str, dialog: List[str]) -> None:
+    """
+    Кладёт строку диалога в очередь для последующей пакетной записи в Google Sheets.
+    """
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    conversation = "\n".join(dialog)
+    row = [timestamp, phone, conversation]
+    with pending_lock:
+        pending_rows.append(row)
 
+def flush_worker() -> None:
+    """
+    Фоновая задача: раз в 10 секунд или при накоплении >=3 записей
+    отправляет их батчем в Google Sheets.
+    Обрабатывает временные ошибки (429/5xx) экспоненциальным бэкоффом.
+    """
+    last_flush_time = time.time()
+    while True:
+        time.sleep(1)
+        with pending_lock:
+            count = len(pending_rows)
+            if count == 0:
+                continue
+            now = time.time()
+            if count < 3 and (now - last_flush_time < 10):
+                continue
+            # забираем пакет
+            batch = pending_rows[:]
+            pending_rows.clear()
+
+        # пробуем отправить
+        success = False
+        give_up = False
+        backoff = 1
+        for attempt in range(5):
+            try:
+                sheet = get_sheet()
+                if sheet is None:
+                    # Нет соединения с Sheets — вернём записи назад и подождём
+                    with pending_lock:
+                        pending_rows[0:0] = batch
+                    time.sleep(5)
+                    break
+                sheet.append_rows(batch, value_input_option='RAW')
+                success = True
+                last_flush_time = time.time()
+                break
+            except APIError as e:
+                # Попробуем извлечь код ошибки
+                error_code = None
+                if hasattr(e, 'response') and e.response is not None:
+                    try:
+                        err_json = e.response.json()
+                        if isinstance(err_json, dict):
+                            error_code = err_json.get('error', {}).get('code')
+                    except Exception:
+                        if hasattr(e.response, 'status_code'):
+                            error_code = e.response.status_code
+                if error_code is None:
+                    m = re.search(r'"code":\s*(\d+)', str(e))
+                    if m:
+                        error_code = int(m.group(1))
+
+                if error_code == 429 or (isinstance(error_code, int) and 500 <= error_code < 600):
+                    print(f"[Sheets] Временная ошибка {error_code}, попытка {attempt+1}/5; повтор через {backoff}с")
+                    time.sleep(backoff)
+                    backoff = min(backoff * 2, 60)
+                    continue
+                else:
+                    print(f"[Sheets] Критическая ошибка, не ретраим: {e}")
+                    give_up = True
+                    break
+            except Exception as e:
+                print(f"[Sheets] Неожиданная ошибка: {e}")
+                time.sleep(backoff)
+                backoff = min(backoff * 2, 60)
+                continue
+
+        if not success:
+            if give_up:
+                print("[Sheets] Пакет записей пропущен из-за критической ошибки.")
+            else:
+                # Вернуть в очередь для повторной отправки позже
+                with pending_lock:
+                    pending_rows[0:0] = batch
+
+# Старт фонового потока
+threading.Thread(target=flush_worker, daemon=True).start()
+
+# ===============================
+# Вспомогательные функции Диалогов/НЛП
+# ===============================
 def normalize_text(text: str) -> str:
     """
-    Нормализация текста: удаление пунктуации, пробелов, приведение к нижнему регистру.
+    Нормализация: удалить всё, кроме букв/цифр, привести к нижнему регистру.
+    Это даёт стабильное сравнение «одинаковых» вопросов.
     """
-    # Оставляем только буквы и цифры, приводим к нижнему регистру
-    normalized = "".join(ch.lower() for ch in text if ch.isalnum())
-    return normalized
+    return "".join(ch.lower() for ch in text if ch.isalnum())
 
 def classify_message(text: str) -> str:
     """
-    Классификация входящего сообщения на категории: 'greeting' (приветствие),
-    'question' (вопрос), 'noise' (шум/бессмысленный набор).
+    Классификация стартового сообщения: 'greeting' | 'question' | 'noise'
+    - noise: нет букв/цифр или пусто
+    - question: >=4 слов и вопросительная форма (вопрос. слово или '?')
+    - greeting: типичные приветствия
     """
-    text_stripped = text.strip()
-    if text_stripped == "":
+    t = text.strip()
+    if t == "":
         return "noise"
-    # Проверяем на шум: если нет ни одной буквы/цифры (только символы/эмодзи)
-    alnum_count = sum(ch.isalnum() for ch in text_stripped)
-    if alnum_count == 0:
+    if sum(ch.isalnum() for ch in t) == 0:
         return "noise"
-    # Подсчитываем слова
-    words = text_stripped.lower().split()
+
+    words = t.lower().split()
     word_count = len(words)
-    # Список типичных приветствий
+
     greetings = ["привет", "здравствуйте", "добрый день", "доброе утро", "добрый вечер", "здравствуй", "hi", "hello"]
-    # Список слов-показателей вопроса (на русском)
     question_words = ["что", "как", "почему", "зачем", "когда", "где", "какой", "какая", "какие"]
-    # Если сообщение похоже на вопрос (достаточно длинное и содержит вопросит. конструкцию)
-    if word_count >= 4 and ("?" in text_stripped or any(qw in text_stripped.lower() for qw in question_words)):
+
+    if word_count >= 4 and ("?" in t or any(qw in t.lower() for qw in question_words)):
         return "question"
-    # Если сообщение содержит типичное приветствие и не было классифицировано как вопрос
     for greet in greetings:
-        if greet in text_stripped.lower():
+        if greet in t.lower():
             return "greeting"
-    # Иное сообщение (по умолчанию считаем приветствием/началом диалога)
     return "greeting"
 
 def gpt_reply_short(user_text: str) -> str:
-    """Ответ ассистента, упрощённый и до 400 символов."""
+    """
+    Краткий, понятный ответ (до ~400 символов).
+    """
     resp = openai_client.chat.completions.create(
         model="gpt-3.5-turbo",
         messages=[
@@ -96,130 +222,87 @@ def gpt_reply_short(user_text: str) -> str:
             },
             {"role": "user", "content": user_text}
         ],
-        max_tokens=220,  # достаточно для краткого ответа
+        max_tokens=220,
         temperature=0.2
     )
     text = resp.choices[0].message.content.strip()
-    # Жёсткое ограничение символов как страховка
     if len(text) > 400:
         text = text[:400].rstrip() + "…"
     return text
 
-def simplify_answer_text(answer_text: str) -> str:
+def alternative_solution(user_question: str, previous_answer: str) -> str:
     """
-    Перефразирует заданный текст ответа более простым и понятным языком.
-    Используется, если пользователь повторно задаёт тот же вопрос.
+    Генерирует ИНОЙ подход/стратегию (не повторять предыдущий ответ).
+    Даст краткий план, когда применять, риски/минусы.
+    """
+    prompt = (
+        "Пользователь задал вопрос:\n"
+        f"{user_question}\n\n"
+        "Ты уже предложил один способ (не повторяй его):\n"
+        f"{previous_answer}\n\n"
+        "Теперь предложи ДРУГОЙ подход/стратегию решения. Обязательно:\n"
+        "1) Краткий план шагов (3–6 шагов)\n"
+        "2) Когда этот подход лучше применять\n"
+        "3) Возможные риски/минусы\n"
+        "Избегай повторения предыдущих шагов и формулировок. До 700 символов."
+    )
+    resp = openai_client.chat.completions.create(
+        model="gpt-3.5-turbo",
+        messages=[
+            {"role": "system", "content": "Ты инженер-консультант. Давай практичные варианты решения в разных стилях."},
+            {"role": "user", "content": prompt}
+        ],
+        max_tokens=450,
+        temperature=0.7,
+        presence_penalty=0.6,
+        frequency_penalty=0.4
+    )
+    return resp.choices[0].message.content.strip()
+
+def followup_question(user_question: str, previous_answer: str) -> str:
+    """
+    Один короткий уточняющий вопрос, чтобы выбрать другой путь.
     """
     resp = openai_client.chat.completions.create(
         model="gpt-3.5-turbo",
         messages=[
-            {
-                "role": "system",
-                "content": "Объясни пользователю предыдущий ответ более простым и понятным языком, избегая технических терминов."
-            },
-            {"role": "user", "content": answer_text}
+            {"role": "system", "content": "Сформулируй один уточняющий вопрос по сути проблемы, без лишних слов."},
+            {"role": "user", "content": f"Вопрос пользователя: {user_question}\nПредыдущий ответ: {previous_answer}\nСпроси один уточняющий вопрос."}
         ],
-        max_tokens=300,
-        temperature=0.3
+        max_tokens=60,
+        temperature=0.2
     )
-    simplified = resp.choices[0].message.content.strip()
-    return simplified
+    return resp.choices[0].message.content.strip()
 
-def save_to_sheet(phone: str, dialog: list[str]):
+def get_last_bot_answer(dialog: List[str]) -> str:
     """
-    Сохраняет диалог в очередь для записи в Google Sheets (асинхронно из отдельного потока).
+    Возвращает текст последнего ответа бота из истории диалога (если есть).
     """
-    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    conversation = "\n".join(dialog)
-    row = [timestamp, phone, conversation]
-    # Помещаем запись в очередь
-    with pending_lock:
-        pending_rows.append(row)
-
-def get_last_bot_answer(dialog: list[str]) -> str:
-    """Возвращает текст последнего ответа бота из истории диалога."""
     for entry in reversed(dialog):
         if entry.startswith("Бот:"):
-            # Возвращаем текст после префикса "Бот: "
             return entry[5:].strip()
     return ""
 
-# Фоновый поток для периодической записи накопленных диалогов в Google Sheets
-def flush_worker():
-    """
-    Фоновая задача: раз в 10 секунд либо при накоплении 3 и более записей отправляет данные в Google Sheets.
-    Реализована с экспоненциальным бэкоффом при ошибках 429 или 5xx.
-    """
-    last_flush_time = time.time()
-    while True:
-        time.sleep(1)
-        with pending_lock:
-            count = len(pending_rows)
-            if count == 0:
-                continue  # нет данных для отправки
-            now = time.time()
-            if count < 3 and (now - last_flush_time < 10):
-                # Недостаточно записей и 10 секунд ещё не прошло
-                continue
-            # Забираем копию накопленных записей для отправки и очищаем очередь
-            batch = pending_rows[:]
-            pending_rows.clear()
-        # Пытаемся отправить batch в Google Sheets
-        success = False
-        give_up = False
-        backoff = 1
-        for attempt in range(5):
-            try:
-                sheet.append_rows(batch, value_input_option='RAW')
-                success = True
-                last_flush_time = time.time()
-                break
-            except APIError as e:
-                # Получаем код ошибки, если доступен
-                error_code = None
-                if hasattr(e, 'response'):
-                    try:
-                        err_json = e.response.json()
-                        if isinstance(err_json, dict):
-                            error_code = err_json.get('error', {}).get('code')
-                    except Exception:
-                        if hasattr(e.response, 'status_code'):
-                            error_code = e.response.status_code
-                if error_code is None:
-                    match = re.search(r'"code":\s*(\d+)', str(e))
-                    if match:
-                        error_code = int(match.group(1))
-                # Проверяем, является ли ошибка временной (429 или 5xx)
-                if error_code == 429 or (error_code is not None and 500 <= error_code < 600):
-                    # Временная ошибка: ждем с экспоненциальным ростом интервала и повторяем
-                    print(f"Предупреждение: получена ошибка {error_code} при сохранении, повтор через {backoff} сек.")
-                    time.sleep(backoff)
-                    backoff = min(backoff * 2, 60)
-                    continue
-                else:
-                    # Критическая/непоправимая ошибка - прерываем попытки
-                    print(f"Ошибка записи в Google Sheets (не ретрай): {e}")
-                    give_up = True
-                    break
-        if not success:
-            if give_up:
-                # Отбрасываем batch при критической ошибке, чтобы не зациклить поток
-                print("Запись диалога пропущена из-за критической ошибки.")
-            else:
-                # В случае временной неудачи: возвращаем записи обратно в очередь для повторной попытки позже
-                with pending_lock:
-                    pending_rows[0:0] = batch
-
-# Запуск фонового потока для записи в Google Sheets
-flush_thread = threading.Thread(target=flush_worker, daemon=True)
-flush_thread.start()
-
+# ===============================
+# UI-тексты
+# ===============================
 CONSULT_ENDING_MENU = (
     "\n\nВыберите:\n"
     "1 — Всё понятно, спасибо\n"
     "2 — Требуется дополнительная консультация"
 )
 
+# ===============================
+# Healthcheck
+# ===============================
+@app.route("/health", methods=["GET", "POST"])
+def health():
+    # Минимальный ответ (Twilio и Railway довольно нетребовательны)
+    return ("ok", 200)
+
+# ===============================
+# Основной вебхук WhatsApp
+# ===============================
 @app.route("/webhook", methods=["POST"])
 def whatsapp_reply():
     incoming_msg = request.values.get("Body", "").strip()
@@ -230,29 +313,25 @@ def whatsapp_reply():
     state = user_states.get(sender_number, "start")
     dialog = user_messages.get(sender_number, [])
 
-    # Начало диалога: классифицируем сообщение
+    # START: классифицируем первое сообщение
     if state == "start":
         category = classify_message(incoming_msg)
         if category == "noise":
-            # Шум/бессмысленное сообщение: просим пользователя сформулировать запрос
             msg.body("Пожалуйста, напишите, с чем вам нужна помощь, в одном-двух предложениях.")
-            # Оставляем состояние "start" без изменений, диалог не инициируется
             return str(resp)
         elif category == "question":
-            # Пользователь сразу задал вопрос -> переходим сразу к консультации
+            # Сразу консультация: краткий ответ и меню 1/2
             user_states[sender_number] = "consultation_menu"
-            # Создаем новую историю диалога с первым вопросом пользователя
             user_messages[sender_number] = [f"Пользователь: {incoming_msg}"]
-            # Получаем краткий ответ от GPT и добавляем его в диалог
             answer = gpt_reply_short(incoming_msg)
             user_messages[sender_number].append(f"Бот: {answer}")
-            # Сохраняем нормализованный вопрос для обнаружения повторных вопросов
+            # Инициализируем контроль повторов
             last_question_norm[sender_number] = normalize_text(incoming_msg)
-            # Отправляем ответ с меню вариантов продолжения
+            repeat_count[sender_number] = 0
             msg.body(answer + CONSULT_ENDING_MENU)
             return str(resp)
         else:
-            # Приветствие или общее сообщение: показываем стандартное стартовое меню
+            # Приветствие: показываем меню выбора
             user_states[sender_number] = "awaiting_choice"
             user_messages[sender_number] = [f"Пользователь: {incoming_msg}"]
             msg.body(
@@ -263,11 +342,11 @@ def whatsapp_reply():
             )
             return str(resp)
 
-    # Выбор ветки (ожидание выбора 1/2/3 после стартового меню)
+    # Меню выбора 1/2/3
     if state == "awaiting_choice":
         dialog.append(f"Пользователь: {incoming_msg}")
         if incoming_msg == "1":
-            user_states[sender_number] = "consultation"  # переводим в режим консультации, ожидаем вопрос
+            user_states[sender_number] = "consultation"
             msg.body("Расскажите подробнее, с чем Вам необходимо помочь?")
         elif incoming_msg == "2":
             user_states[sender_number] = "repair"
@@ -279,69 +358,78 @@ def whatsapp_reply():
             msg.body("Пожалуйста, введите 1, 2 или 3.")
         return str(resp)
 
-    # Консультация: получаем вопрос пользователя -> даём краткий ответ -> показываем меню 1/2
+    # Консультация: первый или следующий вопрос
     if state == "consultation":
         dialog.append(f"Пользователь: {incoming_msg}")
-        # Проверяем, не повторяет ли пользователь свой предыдущий вопрос
         norm_incoming = normalize_text(incoming_msg)
-        repeated = (sender_number in last_question_norm and norm_incoming == last_question_norm[sender_number])
-        if repeated:
-            # Повторный вопрос: переформулируем предыдущий ответ более простым языком
-            last_answer_text = get_last_bot_answer(dialog)
-            if last_answer_text:
-                answer = simplify_answer_text(last_answer_text)
-            else:
-                # На случай, если предыдущий ответ не найден
-                answer = gpt_reply_short(incoming_msg)
+        is_repeat = (sender_number in last_question_norm and norm_incoming == last_question_norm[sender_number])
+
+        cnt = repeat_count.get(sender_number, 0)
+        if is_repeat:
+            cnt += 1
+            repeat_count[sender_number] = cnt
         else:
-            # Новый вопрос: получаем стандартный краткий ответ
+            repeat_count[sender_number] = 0
+
+        if is_repeat and cnt >= 1:
+            last_ans = get_last_bot_answer(dialog) or ""
+            answer = alternative_solution(incoming_msg, last_ans)
+        else:
             answer = gpt_reply_short(incoming_msg)
-        # Добавляем ответ бота в диалог и обновляем запись о последнем вопросе
+
         dialog.append(f"Бот: {answer}")
         last_question_norm[sender_number] = norm_incoming
-        # Показываем меню продолжения/завершения консультации
         user_states[sender_number] = "consultation_menu"
         msg.body(answer + CONSULT_ENDING_MENU)
         return str(resp)
 
-    # Меню после консультации (ожидание ответа 1 или 2, либо новый вопрос от пользователя)
+    # Меню после консультации (1 — завершить, 2 — ещё вопрос, либо прислали новый/повторный вопрос)
     if state == "consultation_menu":
+        # Завершение
         if incoming_msg == "1":
             dialog.append("Пользователь: Всё понятно, спасибо")
-            final_reply = "Рад помочь! Если появятся вопросы — пишите."
-            dialog.append(f"Бот: {final_reply}")
-            msg.body(final_reply)
-            # Сохраняем диалог в Google Sheets и сбрасываем состояние пользователя
+            final = "Рад помочь! Если появятся вопросы — пишите."
+            dialog.append(f"Бот: {final}")
+            msg.body(final)
             save_to_sheet(sender_number, dialog)
+            # очистка состояний
             user_states.pop(sender_number, None)
             user_messages.pop(sender_number, None)
             last_question_norm.pop(sender_number, None)
+            repeat_count.pop(sender_number, None)
             return str(resp)
+        # Доп. консультация
         elif incoming_msg == "2":
             dialog.append("Пользователь: Требуется дополнительная консультация")
-            # Возвращаемся в состояние ожидания следующего вопроса от пользователя
             user_states[sender_number] = "consultation"
             msg.body("Пожалуйста, уточните ваш вопрос или опишите детали.")
             return str(resp)
+        # Прислан новый/повторный вопрос вместо выбора 1/2
         else:
-            # Пользователь прислал новый или повторный вопрос вместо выбора 1/2
             dialog.append(f"Пользователь: {incoming_msg}")
             norm_incoming = normalize_text(incoming_msg)
-            repeated = (sender_number in last_question_norm and norm_incoming == last_question_norm[sender_number])
-            if repeated:
-                # Повторный вопрос: упрощаем предыдущий ответ
-                last_answer_text = get_last_bot_answer(dialog)
-                if last_answer_text:
-                    answer = simplify_answer_text(last_answer_text)
-                else:
-                    answer = gpt_reply_short(incoming_msg)
+            is_repeat = (sender_number in last_question_norm and norm_incoming == last_question_norm[sender_number])
+
+            cnt = repeat_count.get(sender_number, 0)
+            if is_repeat:
+                cnt += 1
+                repeat_count[sender_number] = cnt
             else:
-                # Новый дополнительный вопрос: запрашиваем ответ у GPT
+                repeat_count[sender_number] = 0
+
+            if is_repeat and cnt >= 1:
+                last_ans = get_last_bot_answer(dialog) or ""
+                alt = alternative_solution(incoming_msg, last_ans)
+                if cnt >= 2:
+                    q = followup_question(incoming_msg, last_ans)
+                    answer = f"{alt}\n\nУточните, пожалуйста: {q}"
+                else:
+                    answer = alt
+            else:
                 answer = gpt_reply_short(incoming_msg)
+
             dialog.append(f"Бот: {answer}")
-            # Обновляем последний вопрос пользователя
             last_question_norm[sender_number] = norm_incoming
-            # Оставляем пользователя в меню консультации для дальнейших действий
             msg.body(answer + CONSULT_ENDING_MENU)
             return str(resp)
 
@@ -355,6 +443,7 @@ def whatsapp_reply():
         user_states.pop(sender_number, None)
         user_messages.pop(sender_number, None)
         last_question_norm.pop(sender_number, None)
+        repeat_count.pop(sender_number, None)
         return str(resp)
 
     # Программное обеспечение
@@ -367,15 +456,23 @@ def whatsapp_reply():
         user_states.pop(sender_number, None)
         user_messages.pop(sender_number, None)
         last_question_norm.pop(sender_number, None)
+        repeat_count.pop(sender_number, None)
         return str(resp)
 
-    # Фолбэк на непредвиденные случаи
+    # Фолбэк
     msg.body("Произошла ошибка. Давайте начнём заново. Напишите любое сообщение.")
-    # Сбрасываем состояние на начальное
     user_states.pop(sender_number, None)
     user_messages.pop(sender_number, None)
     last_question_norm.pop(sender_number, None)
+    repeat_count.pop(sender_number, None)
     return str(resp)
-@app.route("/health", methods=["GET", "POST"])
-def health():
-    return ("ok", 200)
+
+# ===============================
+# Локальный запуск (dev)
+# ===============================
+if __name__ == "__main__":
+    # Для локальных тестов: python app.py
+    port = int(os.environ.get("PORT", 5000))
+    # В продакшене на Railway запускайте через gunicorn:
+    # gunicorn app:app --bind 0.0.0.0:$PORT --workers 1 --threads 8 --timeout 120
+    app.run(host="0.0.0.0", port=port, debug=True)
