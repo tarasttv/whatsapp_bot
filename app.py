@@ -10,6 +10,7 @@ import re
 import traceback
 from typing import Dict, List, Optional
 
+import requests  # >>> NEW: для Telegram
 import gspread
 from gspread.exceptions import APIError
 from flask import Flask, request
@@ -18,6 +19,12 @@ from google.oauth2 import service_account
 from twilio.twiml.messaging_response import MessagingResponse
 
 app = Flask(__name__)
+
+# ===============================
+# ENV / Secrets
+# ===============================
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")  # >>> NEW
+TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")    # >>> NEW
 
 # ===============================
 # OpenAI client
@@ -60,7 +67,6 @@ def get_sheet() -> Optional[gspread.Worksheet]:
         return _sheet
     except Exception as e:
         _gsheets_error = f"{e}\n{traceback.format_exc()}"
-        # Не падаем — вернём None; запись попробуем позже/повторно
         return None
 
 # ===============================
@@ -68,11 +74,11 @@ def get_sheet() -> Optional[gspread.Worksheet]:
 # ===============================
 user_states: Dict[str, str] = {}
 user_messages: Dict[str, List[str]] = {}
-
-# Последний нормализованный вопрос пользователя (для детекта повторов)
 last_question_norm: Dict[str, str] = {}
-# Счётчик повторов одинакового вопроса
 repeat_count: Dict[str, int] = {}
+
+# >>> NEW: метаданные (имя/источник)
+user_meta: Dict[str, Dict[str, str]] = {}  # {phone: {"name":..., "source":...}}
 
 # ===============================
 # Очередь на запись в Google Sheets
@@ -83,10 +89,14 @@ pending_lock = threading.Lock()
 def save_to_sheet(phone: str, dialog: List[str]) -> None:
     """
     Кладёт строку диалога в очередь для последующей пакетной записи в Google Sheets.
+    Формат: timestamp | phone | profile_name | source | conversation
     """
+    meta = user_meta.get(phone, {})
+    profile_name = meta.get("name","")
+    source = meta.get("source","")
     timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     conversation = "\n".join(dialog)
-    row = [timestamp, phone, conversation]
+    row = [timestamp, phone, profile_name, source, conversation]
     with pending_lock:
         pending_rows.append(row)
 
@@ -94,7 +104,6 @@ def flush_worker() -> None:
     """
     Фоновая задача: раз в 10 секунд или при накоплении >=3 записей
     отправляет их батчем в Google Sheets.
-    Обрабатывает временные ошибки (429/5xx) экспоненциальным бэкоффом.
     """
     last_flush_time = time.time()
     while True:
@@ -106,11 +115,9 @@ def flush_worker() -> None:
             now = time.time()
             if count < 3 and (now - last_flush_time < 10):
                 continue
-            # забираем пакет
             batch = pending_rows[:]
             pending_rows.clear()
 
-        # пробуем отправить
         success = False
         give_up = False
         backoff = 1
@@ -118,7 +125,6 @@ def flush_worker() -> None:
             try:
                 sheet = get_sheet()
                 if sheet is None:
-                    # Нет соединения с Sheets — вернём записи назад и подождём
                     with pending_lock:
                         pending_rows[0:0] = batch
                     time.sleep(5)
@@ -128,7 +134,6 @@ def flush_worker() -> None:
                 last_flush_time = time.time()
                 break
             except APIError as e:
-                # Попробуем извлечь код ошибки
                 error_code = None
                 if hasattr(e, 'response') and e.response is not None:
                     try:
@@ -145,8 +150,7 @@ def flush_worker() -> None:
 
                 if error_code == 429 or (isinstance(error_code, int) and 500 <= error_code < 600):
                     print(f"[Sheets] Временная ошибка {error_code}, попытка {attempt+1}/5; повтор через {backoff}с")
-                    time.sleep(backoff)
-                    backoff = min(backoff * 2, 60)
+                    time.sleep(backoff); backoff = min(backoff * 2, 60)
                     continue
                 else:
                     print(f"[Sheets] Критическая ошибка, не ретраим: {e}")
@@ -154,15 +158,13 @@ def flush_worker() -> None:
                     break
             except Exception as e:
                 print(f"[Sheets] Неожиданная ошибка: {e}")
-                time.sleep(backoff)
-                backoff = min(backoff * 2, 60)
+                time.sleep(backoff); backoff = min(backoff * 2, 60)
                 continue
 
         if not success:
             if give_up:
                 print("[Sheets] Пакет записей пропущен из-за критической ошибки.")
             else:
-                # Вернуть в очередь для повторной отправки позже
                 with pending_lock:
                     pending_rows[0:0] = batch
 
@@ -170,71 +172,50 @@ def flush_worker() -> None:
 threading.Thread(target=flush_worker, daemon=True).start()
 
 # ===============================
-# Вспомогательные функции Диалогов/НЛП
+# Вспомогательные функции
 # ===============================
+def tg_notify(text: str) -> None:
+    """Отправка уведомления в Telegram (если заданы токен/чат)."""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode":"HTML"},
+            timeout=6
+        )
+    except Exception as e:
+        print(f"[TG] notify error: {e}")
+
 def normalize_text(text: str) -> str:
-    """
-    Нормализация: удалить всё, кроме букв/цифр, привести к нижнему регистру.
-    Это даёт стабильное сравнение «одинаковых» вопросов.
-    """
     return "".join(ch.lower() for ch in text if ch.isalnum())
 
 def classify_message(text: str) -> str:
-    """
-    Классификация стартового сообщения: 'greeting' | 'question' | 'noise'
-    - noise: нет букв/цифр или пусто
-    - question: >=4 слов и вопросительная форма (вопрос. слово или '?')
-    - greeting: типичные приветствия
-    """
     t = text.strip()
-    if t == "":
-        return "noise"
-    if sum(ch.isalnum() for ch in t) == 0:
-        return "noise"
-
+    if t == "": return "noise"
+    if sum(ch.isalnum() for ch in t) == 0: return "noise"
     words = t.lower().split()
-    word_count = len(words)
-
-    greetings = ["привет", "здравствуйте", "добрый день", "доброе утро", "добрый вечер", "здравствуй", "hi", "hello"]
-    question_words = ["что", "как", "почему", "зачем", "когда", "где", "какой", "какая", "какие"]
-
-    if word_count >= 4 and ("?" in t or any(qw in t.lower() for qw in question_words)):
+    greetings = ["привет","здравствуйте","добрый день","доброе утро","добрый вечер","здравствуй","hi","hello"]
+    question_words = ["что","как","почему","зачем","когда","где","какой","какая","какие"]
+    if len(words) >= 4 and ("?" in t or any(qw in t for qw in question_words)):
         return "question"
     for greet in greetings:
-        if greet in t.lower():
-            return "greeting"
+        if greet in t: return "greeting"
     return "greeting"
 
 def gpt_reply_short(user_text: str) -> str:
-    """
-    Краткий, понятный ответ (до ~400 символов).
-    """
     resp = openai_client.chat.completions.create(
         model="gpt-3.5-turbo",
         messages=[
-            {
-                "role": "system",
-                "content": (
-                    "Ты технический консультант. Отвечай максимально кратко, простым языком, "
-                    "по шагам только при необходимости. Избегай канцеляризмов. "
-                    "Строго не более 400 символов текста."
-                )
-            },
-            {"role": "user", "content": user_text}
+            {"role":"system","content":"Ты технический консультант. Отвечай максимально кратко, простым языком. До 400 символов."},
+            {"role":"user","content":user_text}
         ],
-        max_tokens=220,
-        temperature=0.2
+        max_tokens=220, temperature=0.2
     )
-    text = resp.choices[0].message.content.strip()
-    if len(text) > 400:
-        text = text[:400].rstrip() + "…"
-    return text
+    text = (resp.choices[0].message.content or "").strip()
+    return text[:400] + ("…" if len(text) > 400 else "")
 
 def alternative_solution(user_question: str, previous_answer: str) -> str:
-    """
-    Генерирует ИНОЙ подход/стратегию (не повторять предыдущий ответ).
-    Даст краткий план, когда применять, риски/минусы.
-    """
     prompt = (
         "Пользователь задал вопрос:\n"
         f"{user_question}\n\n"
@@ -249,35 +230,25 @@ def alternative_solution(user_question: str, previous_answer: str) -> str:
     resp = openai_client.chat.completions.create(
         model="gpt-3.5-turbo",
         messages=[
-            {"role": "system", "content": "Ты инженер-консультант. Давай практичные варианты решения в разных стилях."},
-            {"role": "user", "content": prompt}
+            {"role":"system","content":"Ты инженер-консультант. Давай практичные варианты решения в разных стилях."},
+            {"role":"user","content":prompt}
         ],
-        max_tokens=450,
-        temperature=0.7,
-        presence_penalty=0.6,
-        frequency_penalty=0.4
+        max_tokens=450, temperature=0.7, presence_penalty=0.6, frequency_penalty=0.4
     )
-    return resp.choices[0].message.content.strip()
+    return (resp.choices[0].message.content or "").strip()
 
 def followup_question(user_question: str, previous_answer: str) -> str:
-    """
-    Один короткий уточняющий вопрос, чтобы выбрать другой путь.
-    """
     resp = openai_client.chat.completions.create(
         model="gpt-3.5-turbo",
         messages=[
-            {"role": "system", "content": "Сформулируй один уточняющий вопрос по сути проблемы, без лишних слов."},
-            {"role": "user", "content": f"Вопрос пользователя: {user_question}\nПредыдущий ответ: {previous_answer}\nСпроси один уточняющий вопрос."}
+            {"role":"system","content":"Сформулируй один уточняющий вопрос по сути проблемы, без лишних слов."},
+            {"role":"user","content":f"Вопрос пользователя: {user_question}\nПредыдущий ответ: {previous_answer}\nСпроси один уточняющий вопрос."}
         ],
-        max_tokens=60,
-        temperature=0.2
+        max_tokens=60, temperature=0.2
     )
-    return resp.choices[0].message.content.strip()
+    return (resp.choices[0].message.content or "").strip()
 
 def get_last_bot_answer(dialog: List[str]) -> str:
-    """
-    Возвращает текст последнего ответа бота из истории диалога (если есть).
-    """
     for entry in reversed(dialog):
         if entry.startswith("Бот:"):
             return entry[5:].strip()
@@ -289,7 +260,8 @@ def get_last_bot_answer(dialog: List[str]) -> str:
 CONSULT_ENDING_MENU = (
     "\n\nВыберите:\n"
     "1 — Всё понятно, спасибо\n"
-    "2 — Требуется дополнительная консультация"
+    "2 — Ещё вопрос\n"
+    "3 — Связаться с инженером"  # >>> NEW
 )
 
 # ===============================
@@ -297,68 +269,77 @@ CONSULT_ENDING_MENU = (
 # ===============================
 @app.route("/health", methods=["GET", "POST"])
 def health():
-    # Минимальный ответ (Twilio и Railway довольно нетребовательны)
     return ("ok", 200)
 
 # ===============================
-# Основной вебхук WhatsApp
+# Основной вебхук WhatsApp (Twilio)
 # ===============================
 @app.route("/webhook", methods=["POST"])
 def whatsapp_reply():
-    incoming_msg = request.values.get("Body", "").strip()
-    sender_number = request.values.get("From", "").replace("whatsapp:", "")
+    incoming_msg = (request.values.get("Body", "") or "").strip()
+    sender_number = (request.values.get("From", "") or "").replace("whatsapp:", "")
+    profile_name = (request.values.get("ProfileName","") or "").strip()  # >>> NEW
     resp = MessagingResponse()
     msg = resp.message()
+
+    # >>> NEW: сохранить имя и источник
+    if sender_number not in user_meta:
+        user_meta[sender_number] = {}
+    if profile_name and not user_meta[sender_number].get("name"):
+        user_meta[sender_number]["name"] = profile_name
+    m_src = re.search(r"\[SRC:([A-Za-z0-9_\-\.]+)\]", incoming_msg)
+    if m_src:
+        user_meta[sender_number]["source"] = m_src.group(1)
 
     state = user_states.get(sender_number, "start")
     dialog = user_messages.get(sender_number, [])
 
-    # START: классифицируем первое сообщение
+    # START
     if state == "start":
         category = classify_message(incoming_msg)
         if category == "noise":
             msg.body("Пожалуйста, напишите, с чем вам нужна помощь, в одном-двух предложениях.")
             return str(resp)
         elif category == "question":
-            # Сразу консультация: краткий ответ и меню 1/2
             user_states[sender_number] = "consultation_menu"
             user_messages[sender_number] = [f"Пользователь: {incoming_msg}"]
             answer = gpt_reply_short(incoming_msg)
             user_messages[sender_number].append(f"Бот: {answer}")
-            # Инициализируем контроль повторов
             last_question_norm[sender_number] = normalize_text(incoming_msg)
             repeat_count[sender_number] = 0
             msg.body(answer + CONSULT_ENDING_MENU)
             return str(resp)
         else:
-            # Приветствие: показываем меню выбора
             user_states[sender_number] = "awaiting_choice"
             user_messages[sender_number] = [f"Пользователь: {incoming_msg}"]
             msg.body(
                 "Добрый день! Чем я могу помочь?\n"
                 "1. Консультация\n"
                 "2. Ремонт / Диагностика\n"
-                "3. Помощь с программным обеспечением"
+                "3. Связаться с инженером"  # >>> NEW
             )
             return str(resp)
 
-    # Меню выбора 1/2/3
+    # Меню выбора
     if state == "awaiting_choice":
         dialog.append(f"Пользователь: {incoming_msg}")
         if incoming_msg == "1":
             user_states[sender_number] = "consultation"
             msg.body("Расскажите подробнее, с чем Вам необходимо помочь?")
+            return str(resp)
         elif incoming_msg == "2":
             user_states[sender_number] = "repair"
             msg.body("Что у Вас случилось? Укажите тип оборудования (ПК/МФУ/телефон и т.п.) и проблему в одном сообщении.")
-        elif incoming_msg == "3":
-            user_states[sender_number] = "software"
-            msg.body("Опишите, что необходимо настроить или установить.")
+            return str(resp)
+        elif incoming_msg == "3":  # >>> NEW
+            user_states[sender_number] = "contact_engineer"
+            msg.body("Как с вами удобнее связаться и когда? Напишите время (сегодня/завтра, интервал) и кратко суть вопроса.")
+            return str(resp)
         else:
             msg.body("Пожалуйста, введите 1, 2 или 3.")
-        return str(resp)
+            return str(resp)
 
-    # Консультация: первый или следующий вопрос
+    # Консультация
     if state == "consultation":
         dialog.append(f"Пользователь: {incoming_msg}")
         norm_incoming = normalize_text(incoming_msg)
@@ -383,29 +364,33 @@ def whatsapp_reply():
         msg.body(answer + CONSULT_ENDING_MENU)
         return str(resp)
 
-    # Меню после консультации (1 — завершить, 2 — ещё вопрос, либо прислали новый/повторный вопрос)
+    # Меню после консультации
     if state == "consultation_menu":
-        # Завершение
         if incoming_msg == "1":
             dialog.append("Пользователь: Всё понятно, спасибо")
             final = "Рад помочь! Если появятся вопросы — пишите."
             dialog.append(f"Бот: {final}")
             msg.body(final)
             save_to_sheet(sender_number, dialog)
-            # очистка состояний
+            # очистка
             user_states.pop(sender_number, None)
             user_messages.pop(sender_number, None)
             last_question_norm.pop(sender_number, None)
             repeat_count.pop(sender_number, None)
+            user_meta.pop(sender_number, None)
             return str(resp)
-        # Доп. консультация
         elif incoming_msg == "2":
-            dialog.append("Пользователь: Требуется дополнительная консультация")
+            dialog.append("Пользователь: Ещё вопрос")
             user_states[sender_number] = "consultation"
             msg.body("Пожалуйста, уточните ваш вопрос или опишите детали.")
             return str(resp)
-        # Прислан новый/повторный вопрос вместо выбора 1/2
+        elif incoming_msg == "3":  # >>> NEW
+            dialog.append("Пользователь: Связаться с инженером")
+            user_states[sender_number] = "contact_engineer"
+            msg.body("Когда удобно созвониться и по какому вопросу? Напишите кратко.")
+            return str(resp)
         else:
+            # прислан новый/повторный вопрос
             dialog.append(f"Пользователь: {incoming_msg}")
             norm_incoming = normalize_text(incoming_msg)
             is_repeat = (sender_number in last_question_norm and norm_incoming == last_question_norm[sender_number])
@@ -433,9 +418,41 @@ def whatsapp_reply():
             msg.body(answer + CONSULT_ENDING_MENU)
             return str(resp)
 
+    # >>> NEW: контакт с инженером
+    if state == "contact_engineer":
+        dialog.append(f"Пользователь: {incoming_msg}")
+        meta = user_meta.get(sender_number, {})
+        lead_text = (
+            f"🔔 <b>Запрос на связь с инженером</b>\n"
+            f"Имя: {meta.get('name','—')}\n"
+            f"Телефон: {sender_number}\n"
+            f"Источник: {meta.get('source','—')}\n"
+            f"Детали: {incoming_msg}"
+        )
+        tg_notify(lead_text)
+        reply = "Спасибо! Передали инженеру. Мы свяжемся с вами в ближайшее время."
+        dialog.append(f"Бот: {reply}")
+        msg.body(reply)
+        save_to_sheet(sender_number, dialog)
+        # очистка
+        user_states.pop(sender_number, None)
+        user_messages.pop(sender_number, None)
+        last_question_norm.pop(sender_number, None)
+        repeat_count.pop(sender_number, None)
+        user_meta.pop(sender_number, None)
+        return str(resp)
+
     # Ремонт / Диагностика
     if state == "repair":
         dialog.append(f"Пользователь: {incoming_msg}")
+        meta = user_meta.get(sender_number, {})
+        tg_notify(
+            f"🧰 <b>Новая заявка (ремонт)</b>\n"
+            f"Имя: {meta.get('name','—')}\n"
+            f"Телефон: {sender_number}\n"
+            f"Источник: {meta.get('source','—')}\n"
+            f"Детали: {incoming_msg}"
+        )
         reply = "Понял. Передаю Вашу заявку в сервисный центр. Мы свяжемся с Вами в ближайшее время."
         dialog.append(f"Бот: {reply}")
         msg.body(reply)
@@ -444,11 +461,20 @@ def whatsapp_reply():
         user_messages.pop(sender_number, None)
         last_question_norm.pop(sender_number, None)
         repeat_count.pop(sender_number, None)
+        user_meta.pop(sender_number, None)
         return str(resp)
 
     # Программное обеспечение
     if state == "software":
         dialog.append(f"Пользователь: {incoming_msg}")
+        meta = user_meta.get(sender_number, {})
+        tg_notify(
+            f"💽 <b>Новая заявка (ПО)</b>\n"
+            f"Имя: {meta.get('name','—')}\n"
+            f"Телефон: {sender_number}\n"
+            f"Источник: {meta.get('source','—')}\n"
+            f"Детали: {incoming_msg}"
+        )
         reply = "Понял. Передаю Вашу заявку в сервисный центр. Мы уточним детали и поможем с установкой/настройкой."
         dialog.append(f"Бот: {reply}")
         msg.body(reply)
@@ -457,6 +483,7 @@ def whatsapp_reply():
         user_messages.pop(sender_number, None)
         last_question_norm.pop(sender_number, None)
         repeat_count.pop(sender_number, None)
+        user_meta.pop(sender_number, None)
         return str(resp)
 
     # Фолбэк
@@ -465,14 +492,12 @@ def whatsapp_reply():
     user_messages.pop(sender_number, None)
     last_question_norm.pop(sender_number, None)
     repeat_count.pop(sender_number, None)
+    user_meta.pop(sender_number, None)
     return str(resp)
 
 # ===============================
 # Локальный запуск (dev)
 # ===============================
 if __name__ == "__main__":
-    # Для локальных тестов: python app.py
     port = int(os.environ.get("PORT", 5000))
-    # В продакшене на Railway запускайте через gunicorn:
-    # gunicorn app:app --bind 0.0.0.0:$PORT --workers 1 --threads 8 --timeout 120
     app.run(host="0.0.0.0", port=port, debug=True)
